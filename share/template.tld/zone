@@ -1,0 +1,10 @@
+; template.tld/zone
+
+$ORIGIN template.tld.
+$TTL 300
+
+$INCLUDE template.tld/zone.d/soa
+$INCLUDE template.tld/zone.d/ns
+$INCLUDE template.tld/zone.d/mx
+$INCLUDE template.tld/zone.d/a_aaaa
+$INCLUDE template.tld/zone.d/keys

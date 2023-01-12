@@ -1,0 +1,47 @@
+#!/bin/sh
+#
+# CDS status check for some top level domains
+#
+# +--------+-----------------------+--------+
+# | TLD(s) | registry              | web UI |
+# +--------+-----------------------+--------+
+# | ch li  | [1]SWITCH             | [2]    |
+# | se nu  | [4]Internetstiftelsen | [5]    |
+# +--------+-----------------------+--------+
+#
+#
+# notes
+#
+# SWITCH:
+# - URL found in [3]"guidelines for CDS processing at SWITCH"
+#   (referenced from [2]), section 5 "CDS Status Check"
+#
+# Internetstiftelsen:
+# - URL found by inspecting browser traffic while using [5]web UI...
+#
+#
+# [1] https://www.switch.ch/
+# [2] https://www.nic.ch/security/cds/
+# [3] https://www.nic.ch/export/shared/.content/files/SWITCH_CDS_Manual_en.pdf
+# [4] https://internetstiftelsen.se/
+# [5] https://cds.registry.se/
+#
+
+filter='cat'
+
+for domain; do
+	type idn >/dev/null 2>&1 && domain="$(idn "$domain")"
+	type  jq >/dev/null 2>&1 && filter='jq .'
+
+	case ${domain##*.} in
+		ch|li)
+			curl -sS "https://registrar.nic.ch/reg/services/cds/$domain?lang=en" | $filter
+			;;
+		se|nu)
+			curl -sS "https://api.registry.se/v2/auto_dnssec/domain_status/$domain" | $filter
+			;;
+		*)
+			echo ".${domain##*.}: unsupported TLD"
+			;;
+	esac
+done

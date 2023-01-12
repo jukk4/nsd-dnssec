@@ -1,0 +1,7 @@
+; template.tld/zone.d/a_aaaa
+foo	IN	A	1.2.3.4
+	IN	AAAA	a:b:c:d::1
+bar	IN	A	1.2.3.5
+	IN	AAAA	a:b:c:d::2
+baz	IN	AAAA	a:b:c:d::3
+

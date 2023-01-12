@@ -1,0 +1,9 @@
+; template.tld/zone.d/soa
+@	IN	SOA	ns0.template.tld. hostmaster.template.tld. (
+			1		; serial
+			4h		; refresh
+			1h		; retry
+			1w		; expire
+			5m		; minimum
+			)
+

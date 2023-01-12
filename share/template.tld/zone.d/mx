@@ -1,0 +1,4 @@
+; template.tld/zone.d/mx
+	IN	MX	10 mx0.template.tld.
+	IN	MX	20 mx1.template.tld.
+

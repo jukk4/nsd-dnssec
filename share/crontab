@@ -1,0 +1,5 @@
+# m  h dom mon dow	command
+20   5 *   *   *	nsd-dnssec-zonesigner
+*/10 * *   *   *	nsd-dnssec-process resume
+50   5 15  */4 *	nsd-dnssec-process start ksk_rollover
+50   5  8  *   *	nsd-dnssec-process start zsk_rollover

@@ -1,0 +1,4 @@
+; template.tld/zone.d/ns
+	IN	NS	ns0.template.tld.
+	IN	NS	ns1.template.tld.
+
