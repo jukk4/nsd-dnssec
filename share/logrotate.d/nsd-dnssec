@@ -1,0 +1,9 @@
+/etc/nsd/zones/*/var/log {
+	olddir log.archive
+	createolddir 755 root root
+	rotate 100
+	yearly
+	nocreate
+	missingok
+	#compress
+}

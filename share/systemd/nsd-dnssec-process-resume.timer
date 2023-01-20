@@ -1,0 +1,10 @@
+[Unit]
+Description=resume pending DNSSEC processes
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=10m
+RandomizedDelaySec=1m
+
+[Install]
+WantedBy=timers.target

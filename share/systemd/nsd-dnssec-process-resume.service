@@ -1,0 +1,7 @@
+[Unit]
+Description=resume pending DNSSEC processes
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nsd-dnssec-process resume
+SuccessExitStatus=TEMPFAIL

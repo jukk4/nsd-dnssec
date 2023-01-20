@@ -1,0 +1,1864 @@
+#!/bin/sh
+#
+# DNSSEC helper script for use with [1]nsd and [2]ldns
+#
+# main functionality of this script:
+# - bootstrapping DNSSEC for a zone
+# - disabling DNSSEC for a zone
+# - rollover a KSK for a zone
+# - rollover a ZSK for a zone
+# - sign a zone
+#
+# o For non-interactive bootstrapping, disabling and KSK rollovers, the zone's
+#   domain name registry is expected to support automated DNSSEC provisioning
+#   via CDS/CDNSKEY RRs (RFC 7344 / RFC 8078).
+# o Key rollovers (KSK and ZSK) are done according to RFC 7583.
+#
+#
+# jukka@salmi.ch 2019-11-16
+#
+# [1] https://www.nlnetlabs.nl/projects/nsd/
+# [2] https://www.nlnetlabs.nl/projects/ldns/
+#
+
+#
+# exit status of this script (see `systemd-analyze exit-status'):
+#
+#   0  SUCCESS   command completed successfully
+#  75  TEMPFAIL  command paused ("try again later")
+#  64  USAGE     usage error
+#   1  FAILURE   other error
+#   x            killed by signal s = x-128
+#
+
+#
+# supported key rollover methods (as described in RFC 7583):
+#
+# KSK
+# o Double-KSK
+# o Double-DS
+# o Double-RRset
+#
+# ZSK
+# o Pre-Publication
+# o Double-Signature
+#
+
+#
+# naming convention used internally for key-related stuff:
+#
+# name  meaning             definition                   location       example
+# -----------------------------------------------------------------------------------------------------
+# kbn   key basename        K<zone>+<alg>+<id>           n/a (virtual)  Ktemplate.tld.+013+53175
+# kbna  key basename alias  symlink to <kbn>             $zone/keys/    KSK -> Ktemplate.tld.+013+53175
+# kf    key file            K<zone>+<alg>+<id>.<suffix>  $zone/keys/    Ktemplate.tld.+013+53175.key
+# kfa   key file alias      <kbna>.<suffix>              n/a (virtual)  KSK.key
+#
+
+PROG=${0##*/}
+
+# name of configuration files
+CONF_NAME="$PROG".conf
+
+# directories to search for global and zone-specific configuration files
+CONF_GLOBAL_DIRS='/etc /usr/local/etc'
+CONF_ZONE_DIRS='./etc .' # relative to $ZONESDIR/$zone
+
+# set defaults (which can be overriden in config files)
+: ${ROLLOVER_METHOD_KSK:=double_ksk} \
+  ${ROLLOVER_METHOD_ZSK:=pre_publication} \
+  ${LDNS_KEYGEN:=ldns-keygen} \
+  ${KEY_ALGORITHM:=ECDSAP256SHA256} \
+  ${LDNS_SIGNZONE:=ldns-signzone_includes} \
+  ${RRSIG_EXPIRE_AFTER_DAYS:=28} \
+  ${NSEC3:=no} \
+  ${SOA_SERIAL_INCREMENT:=zonefile_soa-serial-increment.sh} \
+  ${TTL_EXP_DPROP_TIME:=5 sec} \
+  ${TTL_EXP_EXTRA_TIME:=60 sec} \
+  ${AUTH_NS:=$(hostname -f)} \
+  ${NSD_CONF:=/etc/nsd/nsd.conf} \
+  ${ZONESDIR:=$(nsd-checkconf -o zonesdir "$NSD_CONF")} \
+  ${ZONEFILE_KEYS:=zone.d/keys} \
+  ${ZONEFILE_SOA:=zone.d/soa} \
+  ${LOCKDIR_BASE:=/run/lock}
+
+# zone-specific directories
+VARDIR=var # relative to $ZONESDIR/$zone
+LOGFILE="$VARDIR"/log
+STATUSDIR="$VARDIR"/status
+SKDIR="$VARDIR"/signing_keys
+
+# needs to be kept in sync with nsd-dnssec-process
+EXIT_SUCCESS=0
+EXIT_TEMPFAIL=75
+EXIT_USAGE=64
+EXIT_FAILURE=1
+
+# set in lock()
+LOCKDIR=
+LOCKFILE=
+
+# global options (overridden by command line option)
+opt_q=0
+opt_v=0
+
+
+# show usage of this script, listing only commonly used zone commands by
+# default (in verbose mode, also "internal" zone commands are shown)
+usage()
+{
+	if [ $# -gt 0 ]; then
+		echo "usage: $*" >&2
+	else
+		cat <<-EOF >&2
+		usage:
+		  $PROG zones
+		  $PROG [options] <zone> <zone_command>
+		
+		options:
+		  -q|--quiet    do not print non-critical messages to stdout
+		  -v|--verbose  show all zone commands and options in usage
+		
+		zone commands:
+		EOF
+		if [ $opt_v -eq 0 ]; then
+		# non-verbose
+		cat <<-EOF >&2
+		  bootstrap
+		  disable
+		  ksk_rollover
+		  zsk_rollover
+		  signzone
+		  soa_serial_increment
+		  reload
+		  status
+		  processes
+		EOF
+		else
+		# verbose
+		cat <<-EOF >&2
+		  bootstrap
+		  disable
+		  ksk_rollover (default method: $ROLLOVER_METHOD_KSK)
+		  ksk_rollover_double_ksk
+		  ksk_rollover_double_ds
+		  ksk_rollover_double_rrset
+		  zsk_rollover (default method: $ROLLOVER_METHOD_ZSK)
+		  zsk_rollover_pre_publication
+		  zsk_rollover_double_signature
+		  signzone [<+/-key_basename_alias> [...]]
+		  soa_serial_increment [serial]
+		  reload
+		  status
+		  processes [--debug]
+		  dnsop_dnssec_bootstrapping publish|unpublish <key_file_alias> [...]
+		  keys
+		  list_keys
+		  create_key ksk|zsk <key_basename_alias>
+		  delete_key <key_basename_alias>
+		  rename_key <old_key_basename_alias> <new_key_basename_alias>
+		  signing_keys
+		  is_signing_key <key_basename_alias>
+		  add_signing_key <key_basename_alias>
+		  rm_signing_key <key_basename_alias>
+		  mv_signing_key <old_key_basename_alias> <new_key_basename_alias>
+		  kfa_to_kf <key_file_alias>
+		  kzf_has_kf <key_file_alias>
+		  kzf_add_kf <key_file_alias>
+		  kzf_rm_kf <key_file_alias>
+		  zone_signed
+		  ds_exists [[--debug] <key_file_alias>]
+		  whois_sd
+		  max_ttl <rr_type(s)>
+		  nc_ttl
+		EOF
+		fi
+	fi
+
+	exit $EXIT_USAGE
+}
+
+# log message to zone-specific file
+log()
+{
+	mkdir -p "${LOGFILE%/*}"
+	echo "$(date '+%Y-%m-%d %H:%M:%S %z') $*" >>"$LOGFILE"
+}
+
+# signal caller to retry later,
+# printing message to stdout unless -q was specified
+pause()
+{
+	log "pause: $*"
+	[ $opt_q -eq 0 ] && echo "$PROG: $*"
+	exit $EXIT_TEMPFAIL
+}
+
+# signal caller to give up and to inspect underlying issue,
+# printing message to stderr
+err()
+{
+	local nolog=0
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--nolog) nolog=1; shift ;;
+			*) break ;;
+		esac
+	done
+
+	[ $nolog -eq 1 ] || log "error: $*"
+	echo "$PROG: error: $*" >&2
+	exit $EXIT_FAILURE
+}
+
+# limit concurrent execution of this script to one per zone
+# to make zone commands behave as atomic operations
+lock()
+{
+	LOCKDIR="$LOCKDIR_BASE/$PROG/$zone"
+	LOCKFILE="$LOCKDIR"/pid
+
+	mkdir -p "$LOCKDIR_BASE/$PROG"
+	mkdir "$LOCKDIR" 2>/dev/null && echo $$ >"$LOCKFILE"
+}
+
+_KEEP_LOCK=
+err_locked()
+{
+	_KEEP_LOCK=1
+	opt_q=0
+	pause "locked by PID $(cat "$LOCKFILE")"
+}
+
+unlock()
+{
+	[ "$_KEEP_LOCK" ] || rm -rf "$LOCKDIR"
+}
+
+set_traps()
+{
+	trap ':'      INT  || err 'trap'
+	trap 'unlock' EXIT || err 'trap'
+}
+
+# let global settings override defaults, and
+# let zone-specific settings override global settings and defaults
+get_settings()
+{
+	local dir=
+
+	for dir in $CONF_GLOBAL_DIRS $CONF_ZONE_DIRS; do
+		[ -f "$dir/$CONF_NAME" ] && . "$dir/$CONF_NAME"
+	done
+}
+
+# escape some (extended) regex special characters
+esc()
+{
+	[ $# -eq 1 ] || usage 'esc <string>'
+
+	echo "$1" | sed -E 's/([$.+])/\\\1/g'
+}
+
+# store TTL of type(s) $1 to file $2 unless that file already exists
+# - if $1 is 'SOA.nc': store negative caching TTL
+# - otherwise:         store largest TTL of RR types $1
+store_ttl()
+{
+	local ttl_types="$1" # "SOA.nc", single RR type or comma-separated list of RR types
+	local ttl_file="$2"
+	local ttl=
+
+	[ $# -eq 2 ] || err 'store_ttl <ttl_type(s)> <ttl_file>'
+
+	if [ ! -e "$ttl_file" ]; then
+		case "$ttl_types" in
+			SOA.nc)
+				ttl=$(nc_ttl)
+				;;
+			*)
+				ttl=$(max_ttl "$ttl_types")
+				;;
+		esac
+		[ "$ttl" ] || err "failed to get TTL"
+		echo "$ttl" >"$ttl_file"
+	fi
+}
+
+# defer until it's safe to continue with whatever is left to be done
+#
+# That time (in seconds since epoch) considered safe to continue is read from
+# file $3 if that exists and calculated and stored there otherwise.
+# Calculation is based on the current time plus the TTL read from file $2
+# (determined and stored there by store_ttl() if file $2 doesn't exist) plus
+# any extra time specified in the `date -d' type string $4 if supplied.
+#
+defer()
+{
+	local ttl_types="$1" # "SOA.nc", single RR type or comma-separated list of RR types
+	local ttl_file="$2"
+	local continue_time_file="$3"
+	local extra_time="$4"
+	local ttl= continue_time= now=
+
+	[ $# -eq 3 -o $# -eq 4 ] ||
+		usage 'defer <ttl_type(s)> <ttl_file> <continue_time_file> [<extra_time>]'
+
+	if [ ! -e "$continue_time_file" ]; then
+		store_ttl "$ttl_types" "$ttl_file"
+		ttl=$(cat "$ttl_file")
+		continue_time=$(date -d "now + $ttl sec${extra_time+ + $extra_time}" '+%s')
+		echo "$continue_time" >"$continue_time_file"
+		rm -f "$ttl_file"
+	fi
+	now=$(date '+%s')
+	continue_time=$(cat "$continue_time_file")
+	[ $now -gt $continue_time ] ||
+		pause "retry after $(($continue_time - $now)) seconds"
+	rm -f "$continue_time_file"
+}
+
+
+#
+# global commands (shown in usage())
+#
+
+# print names of all nsd-configured zones
+zones()
+{
+	local zone=
+
+	[ $# -eq 0 ] || usage
+
+	for zone in $(nsd-checkconf -o zones "$NSD_CONF"); do
+		echo "$zone"
+	done
+}
+
+
+#
+# zone commands (shown in usage())
+#
+
+# bootstrap DNSSEC by publishing CDS and CDNSKEY RRs of the KSK, hoping the
+# registry processes at least one of them according to RFC 7344 / RFC 8078
+bootstrap()
+{
+	local statusfile="$STATUSDIR"/bootstrap
+	local status=0
+	local nc_ttl_file="$statusfile".nc_ttl
+	local nc_ttl_expires_at_file="$statusfile".nc_ttl_expires_at
+
+	[ $# -eq 0 ] || usage
+
+	mkdir -p "${statusfile%/*}"
+	[ -e "$statusfile" ] && status=$(cat "$statusfile")
+	log "bootstrap: initial status: $status"
+
+	# status 0: DNSSEC status is unknown
+
+	if [ $status -lt 1 ]; then
+		zone_signed && err 'DNSSEC already enabled (zone served signed)'
+		ds_exists   && err 'DNSSEC already enabled (DS RR exists)'
+		whois_sd    && err 'DNSSEC already enabled (according to WHOIS)'
+
+		log 'bootstrap: new status: 1'
+		echo '1' >"$statusfile"
+	fi
+
+	# status 1: DNSSEC is disabled
+
+	if [ $status -lt 2 ]; then
+		create_key ksk KSK
+		create_key zsk ZSK
+		signzone +KSK +ZSK
+
+		log 'bootstrap: new status: 2'
+		echo '2' >"$statusfile"
+	fi
+
+	# status 2: keys created, zone signed
+
+	if [ $status -lt 3 ]; then
+		zone_signed || pause 'zone not served signed, please adjust'
+
+		# increment SOA serial and reload zone to make sure newly
+		# signed zone is transferred to secondary name servers
+		signzone
+
+		log 'bootstrap: new status: 3'
+		echo '3' >"$statusfile"
+	fi
+
+	# status 3: zone is served signed
+
+	if [ $status -lt 4 ]; then
+		# publish CDS/CDNSKEY RRs only after negative caching TTL has expired
+		# o RFC 7583 section 3.3.5
+		# o https://securityblog.switch.ch/2014/02/06/zone-file-recommendations/
+		#   -> "SOA minimum"
+		defer SOA.nc \
+			"$nc_ttl_file" \
+			"$nc_ttl_expires_at_file" \
+			"$TTL_EXP_EXTRA_TIME"
+
+		kzf_add_kf KSK.cds
+		kzf_add_kf KSK.cdnskey
+		signzone
+
+		dnsop_dnssec_bootstrapping publish KSK.cds KSK.cdnskey
+
+		log 'bootstrap: new status: 4'
+		echo '4' >"$statusfile"
+	fi
+
+	# status 4: addition of DS RR to parent zone requested
+
+	if [ $status -lt 5 ]; then
+		# wait until DNSSEC is enabled from registry / parent zone point of view
+		ds_exists KSK.ds || pause 'DNSSEC still disabled (no matching DS RR)'
+		whois_sd         || pause 'DNSSEC still disabled (according to WHOIS)'
+
+		# unpublish CDS/CDNSKEY RRs
+		kzf_rm_kf KSK.cds
+		kzf_rm_kf KSK.cdnskey
+		signzone
+
+		dnsop_dnssec_bootstrapping unpublish KSK.cds KSK.cdnskey
+
+		log 'bootstrap: new status: 5'
+		echo '5' >"$statusfile"
+	fi
+
+	# status 5: DNSSEC enabled
+
+	log 'bootstrap: completed'
+	rm -f "$statusfile"
+}
+
+# disable DNSSEC by publishing CDS and CDNSKEY RRs as defined in RFC 8078
+# section 4. "DNSSEC Delete Algorithm" (but see errata!), hoping the registry
+# processes at least one of them
+disable()
+{
+	local statusfile="$STATUSDIR"/disable
+	local status=0
+	local ds_ttl_file="$statusfile".ds_ttl
+	local ds_expires_at_file="$statusfile".ds_expires_at
+	local kbna=
+
+	[ $# -eq 0 ] || usage
+
+	mkdir -p "${statusfile%/*}"
+	[ -e "$statusfile" ] && status=$(cat "$statusfile")
+	log "disable: initial status: $status"
+
+	# status 0: DNSSEC status is unknown
+
+	if [ $status -lt 1 ]; then
+		zone_signed || err 'DNSSEC already disabled (zone served unsigned)'
+		ds_exists   || err 'DNSSEC already disabled (no DS RR)'
+		whois_sd    || err 'DNSSEC already disabled (according to WHOIS)'
+
+		log 'disable: new status: 1'
+		echo '1' >"$statusfile"
+	fi
+
+	# status 1: DNSSEC is enabled
+
+	if [ $status -lt 2 ]; then
+		# TTL of DS RR is needed only at status 3 but it needs to be
+		# determined now because that RR will be gone by then
+		store_ttl DS "$ds_ttl_file"
+
+		# create fake "key" files for CDS/CDNSKEY RRs and a "key" file alias
+		echo "$zone. IN CDS 0 0 0 00"       >keys/K"$zone".+0+0.cds
+		echo "$zone. IN CDNSKEY 0 3 0 AA==" >keys/K"$zone".+0+0.cdnskey
+		ln -s K"$zone".+0+0 keys/disable
+
+		# publish CDS/CDNSKEY RRs
+		kzf_add_kf disable.cds
+		kzf_add_kf disable.cdnskey
+		signzone
+
+		log 'disable: new status: 2'
+		echo '2' >"$statusfile"
+	fi
+
+	# status 2: removal of DS RR from parent zone requested
+
+	if [ $status -lt 3 ]; then
+		ds_exists && pause 'DNSSEC still enabled (DS RR exists)'
+		whois_sd  && pause 'DNSSEC still enabled (according to WHOIS)'
+
+		log 'disable: new status: 3'
+		echo '3' >"$statusfile"
+	fi
+
+	# status 3: DNSSEC disabled from registry / parent zone point of view
+
+	if [ $status -lt 4 ]; then
+		defer DS \
+			"$ds_ttl_file" \
+			"$ds_expires_at_file" \
+			"$TTL_EXP_EXTRA_TIME"
+
+		# unpublish CDS/CDNSKEY RRs
+		kzf_rm_kf disable.cds
+		kzf_rm_kf disable.cdnskey
+
+		# delete all keys
+		for kbna in $(keys); do
+			delete_key "$kbna"
+		done
+
+		# delete signed zone
+		rm -f zone.signed
+
+		log 'disable: new status: 4'
+		echo '4' >"$statusfile"
+	fi
+
+	# status 4: cleanup done
+
+	if [ $status -lt 5 ]; then
+		zone_signed && pause 'zone still served signed, please adjust'
+
+		# increment SOA serial and reload zone to make sure newly
+		# unsigned zone is transferred to secondary name servers
+		soa_serial_increment
+		reload
+
+		log 'disable: new status: 5'
+		echo '5' >"$statusfile"
+	fi
+
+	# status 5: DNSSEC disabled
+
+	log 'disable: completed'
+	rm -f "$statusfile"
+}
+
+# KSK rollover according to configured method
+ksk_rollover()
+{
+	[ $# -eq 0 ] || usage
+
+	type ksk_rollover_$ROLLOVER_METHOD_KSK >/dev/null ||
+		err "invalid KSK rollover method: $ROLLOVER_METHOD_KSK"
+
+	log "ksk_rollover: method $ROLLOVER_METHOD_KSK"
+	ksk_rollover_$ROLLOVER_METHOD_KSK
+}
+
+# KSK rollover according to the "Double-KSK" method described in RFC 7583
+#
+# from RFC 7583 section 3.3.1:
+# "In this rollover, the new DNSKEY is added to the zone.  After an
+#  interval long enough to guarantee that any cached DNSKEY RRsets
+#  contain the new DNSKEY, the DS record in the parent zone is changed.
+#  After a further interval to allow the old DS record to expire from
+#  caches, the old DNSKEY is removed from the zone."
+#
+# pro:
+# - only one interaction with parent
+# con:
+# - increased size of DNSKEY RRset
+#
+ksk_rollover_double_ksk()
+{
+	local statusfile="$STATUSDIR"/ksk_rollover
+	local status=0
+	local dnskey_ttl_file="$statusfile".dnskey_ttl
+	local dnskey_expires_at_file="$statusfile".dnskey_expires_at
+	local ds_ttl_file="$statusfile".ds_ttl
+	local ds_expires_at_file="$statusfile".ds_expires_at
+
+	mkdir -p "${statusfile%/*}"
+	[ -e "$statusfile" ] && status=$(cat "$statusfile")
+	log "ksk_rollover: initial status: $status"
+
+	# status 0: DNSSEC status is unknown
+
+	if [ $status -lt 1 ]; then
+		zone_signed || err 'DNSSEC disabled (zone served unsigned)'
+		ds_exists   || err 'DNSSEC disabled (no DS RR)'
+		whois_sd    || err 'DNSSEC disabled (according to WHOIS)'
+
+		log 'ksk_rollover: new status: 1'
+		echo '1' >"$statusfile"
+	fi
+
+	# status 1: DNSSEC is enabled
+
+	if [ $status -lt 2 ]; then
+		create_key ksk KSKnew
+		signzone +KSKnew
+
+		log 'ksk_rollover: new status: 2'
+		echo '2' >"$statusfile"
+	fi
+
+	# status 2: DNSKEY signed with current and new KSK
+
+	if [ $status -lt 3 ]; then
+		defer DNSKEY \
+			"$dnskey_ttl_file" \
+			"$dnskey_expires_at_file" \
+			"$TTL_EXP_DPROP_TIME + $TTL_EXP_EXTRA_TIME"
+
+		# publish CDS/CDNSKEY RRs of new KSK
+		kzf_add_kf KSKnew.cds
+		kzf_add_kf KSKnew.cdnskey
+		signzone
+
+		log 'ksk_rollover: new status: 3'
+		echo '3' >"$statusfile"
+	fi
+
+	# status 3: replacement of DS RR in parent zone requested
+
+	if [ $status -lt 4 ]; then
+		ds_exists KSKnew.ds || pause 'DS RR of new KSK not yet in parent zone'
+		ds_exists KSK.ds    && pause 'DS RR of old KSK still in parent zone'
+
+		log 'ksk_rollover: new status: 4'
+		echo '4' >"$statusfile"
+	fi
+
+	# status 4: DS RR replaced in parent zone
+
+	if [ $status -lt 5 ]; then
+		defer DS \
+			"$ds_ttl_file" \
+			"$ds_expires_at_file" \
+			"$TTL_EXP_EXTRA_TIME"
+
+		# replace old with new KSK
+		delete_key KSK
+		rename_key KSKnew KSK
+
+		# unpublish CDS/CDNSKEY RRs of new KSK
+		kzf_rm_kf KSK.cds
+		kzf_rm_kf KSK.cdnskey
+		signzone
+
+		log 'ksk_rollover: new status: 5'
+		echo '5' >"$statusfile"
+	fi
+
+	# status 5: KSK rollover complete
+
+	log 'ksk_rollover: completed'
+	rm -f "$statusfile"
+}
+
+# KSK rollover according to the "Double-DS" method described in RFC 7583
+#
+# from RFC 7583 section 3.3.2:
+# "In this rollover, the new DS record is published in the parent zone.
+#  When any caches that contain the DS RRset contain a copy of the new
+#  record, the KSK in the zone is changed.  After a further interval for
+#  the old DNSKEY RRset to expire from caches, the old DS record is
+#  removed from the parent."
+#
+# pro:
+# - minimal size of DNSKEY RRset
+# con:
+# - two interactions with parent
+#
+ksk_rollover_double_ds()
+{
+	local statusfile="$STATUSDIR"/ksk_rollover
+	local status=0
+	local ds_ttl_file="$statusfile".ds_ttl
+	local ds_expires_at_file="$statusfile".ds_expires_at
+	local dnskey_ttl_file="$statusfile".dnskey_ttl
+	local dnskey_expires_at_file="$statusfile".dnskey_expires_at
+
+	mkdir -p "${statusfile%/*}"
+	[ -e "$statusfile" ] && status=$(cat "$statusfile")
+	log "ksk_rollover: initial status: $status"
+
+	# status 0: DNSSEC status is unknown
+
+	if [ $status -lt 1 ]; then
+		zone_signed || err 'DNSSEC disabled (zone served unsigned)'
+		ds_exists   || err 'DNSSEC disabled (no DS RR)'
+		whois_sd    || err 'DNSSEC disabled (according to WHOIS)'
+
+		log 'ksk_rollover: new status: 1'
+		echo '1' >"$statusfile"
+	fi
+
+	# status 1: DNSSEC is enabled
+
+	if [ $status -lt 2 ]; then
+		create_key ksk KSKnew
+
+		# publish CDS/CDNSKEY RRs of current...
+		kzf_add_kf KSK.cds
+		kzf_add_kf KSK.cdnskey
+		# ...and new KSK
+		kzf_add_kf KSKnew.cds
+		kzf_add_kf KSKnew.cdnskey
+
+		signzone # new KSK neither published nor used for signing yet
+
+		log 'ksk_rollover: new status: 2'
+		echo '2' >"$statusfile"
+	fi
+
+	# status 2: addition of new DS RR to parent zone requested
+
+	if [ $status -lt 3 ]; then
+		ds_exists KSKnew.ds || pause 'DS RR of new KSK not yet in parent zone'
+		ds_exists KSK.ds    || err   'DS RR of current KSK not in parent zone anymore!'
+
+		log 'ksk_rollover: new status: 3'
+		echo '3' >"$statusfile"
+	fi
+
+	# status 3: new DS RR added to parent zone
+
+	if [ $status -lt 4 ]; then
+		defer DS \
+			"$ds_ttl_file" \
+			"$ds_expires_at_file" \
+			"$TTL_EXP_EXTRA_TIME"
+
+		# switch KSKs
+		rename_key KSK KSKold
+		rename_key KSKnew KSK
+		signzone +KSK -KSKold
+
+		log 'ksk_rollover: new status: 4'
+		echo '4' >"$statusfile"
+	fi
+
+	# status 4: DNSKEY of new KSK published and used for signing
+
+	if [ $status -lt 5 ]; then
+		defer DNSKEY \
+			"$dnskey_ttl_file" \
+			"$dnskey_expires_at_file" \
+			"$TTL_EXP_DPROP_TIME + $TTL_EXP_EXTRA_TIME"
+
+		# unpublish CDS/CDNSKEY RRs of old KSK
+		# (while keeping those of new KSK published)
+		kzf_rm_kf KSKold.cds
+		kzf_rm_kf KSKold.cdnskey
+		signzone
+
+		log 'ksk_rollover: new status: 5'
+		echo '5' >"$statusfile"
+	fi
+
+	# status 5: removal of old DS RR from parent zone requested
+
+	if [ $status -lt 6 ]; then
+		# wait until old DS RR has been removed from parent zone
+		ds_exists KSKold.ds && pause 'DS RR of old KSK still in parent zone'
+		ds_exists KSK.ds    || err   'DS RR of new KSK not in parent zone anymore!'
+
+		delete_key KSKold
+
+		# unpublish CDS/CDNSKEY RRs of new KSK
+		kzf_rm_kf KSK.cds
+		kzf_rm_kf KSK.cdnskey
+		signzone
+
+		log 'ksk_rollover: new status: 6'
+		echo '6' >"$statusfile"
+	fi
+
+	# status 6: KSK rollover complete
+
+	log 'ksk_rollover: completed'
+	rm -f "$statusfile"
+}
+
+# KSK rollover according to the "Double-RRset" method described in RFC 7583
+#
+# from RFC 7583 section 3.3.3:
+# "In the Double-RRset rollover, the new DNSKEY and DS records are
+#  published simultaneously in the appropriate zones.  Once enough time
+#  has elapsed for the old DNSKEY and DS RRsets to expire from caches,
+#  the old DNSKEY and DS records are removed from their respective
+#  zones."
+#
+# pro:
+# - fast (says RFC...)
+# con:
+# - two interactions with parent
+# - increased size of DNSKEY RRset
+#
+ksk_rollover_double_rrset()
+{
+	local statusfile="$STATUSDIR"/ksk_rollover
+	local status=0
+	local ds_dnskey_ttl_file="$statusfile".ds_dnskey_ttl
+	local ds_dnskey_expires_at_file="$statusfile".ds_dnskey_expires_at
+
+	mkdir -p "${statusfile%/*}"
+	[ -e "$statusfile" ] && status=$(cat "$statusfile")
+	log "ksk_rollover: initial status: $status"
+
+	# status 0: DNSSEC status is unknown
+
+	if [ $status -lt 1 ]; then
+		zone_signed || err 'DNSSEC disabled (zone served unsigned)'
+		ds_exists   || err 'DNSSEC disabled (no DS RR)'
+		whois_sd    || err 'DNSSEC disabled (according to WHOIS)'
+
+		log 'ksk_rollover: new status: 1'
+		echo '1' >"$statusfile"
+	fi
+
+	# status 1: DNSSEC is enabled
+
+	if [ $status -lt 2 ]; then
+		create_key ksk KSKnew
+
+		# publish CDS/CDNSKEY RRs of current...
+		kzf_add_kf KSK.cds
+		kzf_add_kf KSK.cdnskey
+		# ...and new KSK
+		kzf_add_kf KSKnew.cds
+		kzf_add_kf KSKnew.cdnskey
+
+		signzone +KSKnew # new KSK published and also used for signing
+
+		log 'ksk_rollover: new status: 2'
+		echo '2' >"$statusfile"
+	fi
+
+	# status 2: addition of new DS RR to parent zone requested
+
+	if [ $status -lt 3 ]; then
+		ds_exists KSKnew.ds || pause 'DS RR of new KSK not yet in parent zone'
+		ds_exists KSK.ds    || err   'DS RR of current KSK not in parent zone anymore!'
+
+		log 'ksk_rollover: new status: 3'
+		echo '3' >"$statusfile"
+	fi
+
+	# status 3: new DS RR added to parent zone
+
+	if [ $status -lt 4 ]; then
+		defer DS,DNSKEY \
+			"$ds_dnskey_ttl_file" \
+			"$ds_dnskey_expires_at_file" \
+			"$TTL_EXP_DPROP_TIME + $TTL_EXP_EXTRA_TIME"
+
+		# rename keys
+		rename_key KSK KSKold
+		rename_key KSKnew KSK
+
+		# unpublish CDS/CDNSKEY RRs of old KSK
+		# (while keeping those of new KSK published)
+		kzf_rm_kf KSKold.cds
+		kzf_rm_kf KSKold.cdnskey
+		signzone -KSKold
+
+		log 'ksk_rollover: new status: 4'
+		echo '4' >"$statusfile"
+	fi
+
+	# status 4: removal of old DS RR from parent zone requested
+
+	if [ $status -lt 5 ]; then
+		ds_exists KSKold.ds && pause 'DS RR of old KSK still in parent zone'
+		ds_exists KSK.ds    || err   'DS RR of new KSK not in parent zone anymore!'
+
+		log 'ksk_rollover: new status: 5'
+		echo '5' >"$statusfile"
+	fi
+
+	# status 5: old DS RR removed from parent zone
+
+	if [ $status -lt 6 ]; then
+		defer DS,DNSKEY \
+			"$ds_dnskey_ttl_file" \
+			"$ds_dnskey_expires_at_file" \
+			"$TTL_EXP_DPROP_TIME + $TTL_EXP_EXTRA_TIME"
+
+		delete_key KSKold
+
+		# unpublish CDS/CDNSKEY RRs of new KSK
+		kzf_rm_kf KSK.cds
+		kzf_rm_kf KSK.cdnskey
+		signzone
+
+		log 'ksk_rollover: new status: 6'
+		echo '6' >"$statusfile"
+	fi
+
+	# status 6: KSK rollover complete
+
+	log 'ksk_rollover: completed'
+	rm -f "$statusfile"
+}
+
+# ZSK rollover according to configured method
+zsk_rollover()
+{
+	[ $# -eq 0 ] || usage
+
+	type zsk_rollover_$ROLLOVER_METHOD_ZSK >/dev/null ||
+		err "invalid ZSK rollover method: $ROLLOVER_METHOD_ZSK"
+
+	log "zsk_rollover: method $ROLLOVER_METHOD_ZSK"
+	zsk_rollover_$ROLLOVER_METHOD_ZSK
+}
+
+# ZSK rollover according to the "Pre-Publication" method described in RFC 7583
+#
+# from RFC 7583 section 3.2.1:
+# "In this method, the new key is introduced into the DNSKEY RRset.
+#  After enough time to ensure that any cached DNSKEY RRsets contain
+#  both keys, the zone is signed using the new key and the old
+#  signatures are removed.  Finally, when all signatures created with
+#  the old key have expired from caches, the old key is removed."
+#
+# pro:
+# - minimal zone and response sizes
+# con:
+# - complex
+# - slow
+#
+zsk_rollover_pre_publication()
+{
+	local statusfile="$STATUSDIR"/zsk_rollover
+	local status=0
+	local dnskey_ttl_file="$statusfile".dnskey_ttl
+	local dnskey_expires_at_file="$statusfile".dnskey_expires_at
+	local rrsig_ttl_file="$statusfile".rrsig_ttl
+	local rrsig_expires_at_file="$statusfile".rrsig_expires_at
+
+	mkdir -p "${statusfile%/*}"
+	[ -e "$statusfile" ] && status=$(cat "$statusfile")
+	log "zsk_rollover: initial status: $status"
+
+	# status 0: DNSSEC status is unknown
+
+	if [ $status -lt 1 ]; then
+		zone_signed || err 'DNSSEC disabled (zone served unsigned)'
+		ds_exists   || err 'DNSSEC disabled (no DS RR)'
+		whois_sd    || err 'DNSSEC disabled (according to WHOIS)'
+
+		log 'zsk_rollover: new status: 1'
+		echo '1' >"$statusfile"
+	fi
+
+	# status 1: DNSSEC is enabled
+
+	if [ $status -lt 2 ]; then
+		create_key zsk ZSKnew	# create new ZSK...
+		kzf_add_kf ZSKnew.key	# publish its DNSKEY RR...
+		signzone		# but don't use it for signing yet
+
+		log 'zsk_rollover: new status: 2'
+		echo '2' >"$statusfile"
+	fi
+
+	# status 2: DNSKEY of new ZSK published
+
+	if [ $status -lt 3 ]; then
+		defer DNSKEY \
+			"$dnskey_ttl_file" \
+			"$dnskey_expires_at_file" \
+			"$TTL_EXP_DPROP_TIME + $TTL_EXP_EXTRA_TIME"
+
+		# sign zone using new ZSK, keeping DNSKEY RR of old ZSK for now
+
+		rename_key ZSK ZSKold
+		kzf_add_kf ZSKold.key	# DNSKEY RR of old ZSK needs to be kept
+					# included for now, but since this will
+					# not be a signing key anymore it needs
+					# to be added explicitly
+
+		rename_key ZSKnew ZSK
+		kzf_rm_kf ZSK.key	# DNSKEY RR of signing keys are
+					# included by default, and since this
+					# will be a signing key it doesn't need
+					# to be explicitly included any longer
+
+		signzone -ZSKold +ZSK
+
+		log 'zsk_rollover: new status: 3'
+		echo '3' >"$statusfile"
+	fi
+
+	# status 3: zone signed using new ZSK only
+
+	if [ $status -lt 4 ]; then
+		defer RRSIG \
+			"$rrsig_ttl_file" \
+			"$rrsig_expires_at_file" \
+			"$TTL_EXP_DPROP_TIME + $TTL_EXP_EXTRA_TIME"
+
+		# remove old ZSK
+		kzf_rm_kf ZSKold.key
+		delete_key ZSKold
+
+		signzone
+
+		log 'zsk_rollover: new status: 4'
+		echo '4' >"$statusfile"
+	fi
+
+	# status 4: ZSK rollover complete
+
+	log 'zsk_rollover: completed'
+	rm -f "$statusfile"
+}
+
+# ZSK rollover according to the "Double-Signature" method described in RFC 7583
+#
+# from RFC 7583 section 3.2.2:
+# "In this rollover, a new key is introduced and used to sign the zone;
+#  the old key and signatures are retained.  Once all cached DNSKEY and/
+#  or RRSIG information contains copies of the new DNSKEY and RRSIGs
+#  created with it, the old DNSKEY and RRSIGs can be removed from the
+#  zone."
+#
+# pro:
+# - simple
+# - fast
+# con:
+# - increased zone and response sizes
+#
+zsk_rollover_double_signature()
+{
+	local statusfile="$STATUSDIR"/zsk_rollover
+	local status=0
+	local dnskey_rrsig_ttl_file="$statusfile".dnskey_rrsig_ttl
+	local dnskey_rrsig_expires_at_file="$statusfile".dnskey_rrsig_expires_at
+
+	mkdir -p "${statusfile%/*}"
+	[ -e "$statusfile" ] && status=$(cat "$statusfile")
+	log "zsk_rollover: initial status: $status"
+
+	# status 0: DNSSEC status is unknown
+
+	if [ $status -lt 1 ]; then
+		zone_signed || err 'DNSSEC disabled (zone served unsigned)'
+		ds_exists   || err 'DNSSEC disabled (no DS RR)'
+		whois_sd    || err 'DNSSEC disabled (according to WHOIS)'
+
+		log 'zsk_rollover: new status: 1'
+		echo '1' >"$statusfile"
+	fi
+
+	# status 1: DNSSEC is enabled
+
+	if [ $status -lt 2 ]; then
+		create_key zsk ZSKnew	# create new ZSK...
+		signzone +ZSKnew	# and use it for signing
+					# (and thus publish its DNSKEY RR)
+
+		log 'zsk_rollover: new status: 2'
+		echo '2' >"$statusfile"
+	fi
+
+	# status 2: DNSKEY of new ZSK published, zone signed also with new ZSK
+
+	if [ $status -lt 3 ]; then
+		defer DNSKEY,RRSIG \
+			"$dnskey_rrsig_ttl_file" \
+			"$dnskey_rrsig_expires_at_file" \
+			"$TTL_EXP_DPROP_TIME + $TTL_EXP_EXTRA_TIME"
+
+		# replace old with new ZSK
+		delete_key ZSK
+		rename_key ZSKnew ZSK
+
+		signzone
+
+		log 'zsk_rollover: new status: 3'
+		echo '3' >"$statusfile"
+	fi
+
+	# status 3: ZSK rollover complete
+
+	log 'zsk_rollover: completed'
+	rm -f "$statusfile"
+}
+
+# ZSK rollover according to the "Double-RRSIG" method described in RFC 7583
+#
+# not implemented because...
+#   "...it has the disadvantage of the Pre-Publication method in terms of
+#    time taken to perform the rollover, the disadvantage of the Double-
+#    Signature rollover in terms of zone and response sizes, and none of
+#    the advantages of either.  For these reasons, it is unlikely to be
+#    used in any real-world situations..." (from RFC 7583 section 2.1)
+#
+zsk_rollover_double_rrsig()
+{
+	err 'not implemented: zsk_rollover_double_rrsig()'
+}
+
+# sign zone file ./zone and store results in ./zone.signed, taking care of
+# incrementing the SOA serial and reloading the zone in nsd(8)
+#
+# The set of keys to be used for signing can be persistently configured by
+# passing their key basename aliases as arguments to this function, prefixed by
+# a '+' to have that key added to the set, or by a '-' to have it removed from
+# it; e.g.: `signzone -ZSKold +ZSKnew'
+#
+# The most recently used keys are remembered so that if this function is called
+# without arguments, the correct set of keys is used, no matter whether a key
+# rollover or similar process is currently ongoing.
+#
+signzone()
+{
+	local arg=
+	local kbna= kbns=
+	local nsec3=
+	local salt="$(head -c 1024 /dev/random | openssl dgst -sha256 -r | head -c 16)"
+	local expiration=
+
+	log "signzone${*:+ $*}"
+
+	# parse arguments for keys to be added/removed as signing keys
+	for arg; do
+		if [ "${arg#+}" != "$arg" ]; then
+			add_signing_key "${arg#+}"
+		elif [ "${arg#-}" != "$arg" ]; then
+			rm_signing_key "${arg#-}"
+		else
+			err 'usage: signzone [<+/-key_basename_alias> [...]]'
+		fi
+	done
+
+	# build list of key basename aliases to be used for signing
+	for kbna in $(signing_keys); do
+		[ -h keys/"$kbna" ] || err "$kbna: no such key basename alias"
+		kbns="${kbns:+$kbns }keys/$(readlink keys/"$kbna")"
+	done
+	[ "$kbns" ] || err 'no signing key defined'
+
+	[ "$NSEC3" = 'yes' ] && nsec3='-n'
+	expiration=$(date -d "now + $RRSIG_EXPIRE_AFTER_DAYS days" '+%s')
+	soa_serial_increment
+	log "ldns-signzone [...] $kbns"
+	RELATIVE_PATHNAME_REFDIR="$ZONESDIR" \
+	$LDNS_SIGNZONE $nsec3 -s "$salt" -e "$expiration" zone $kbns ||
+		err 'failed to sign zone'
+	reload
+}
+
+# increment SOA serial number
+soa_serial_increment()
+{
+	local zf="$ZONEFILE_SOA"
+	local serial="$1"
+
+	[ $# -le 1 ] || usage
+	log "soa_serial_increment${*:+ $*}"
+
+	$SOA_SERIAL_INCREMENT "$zf" ${serial:+"$serial"} ||
+		err 'failed to increment SOA serial'
+}
+
+# signal nsd to reload zone
+reload()
+{
+	local zf="$ZONEFILE_SOA"
+
+	[ $# -eq 0 ] || usage
+	log "reload${*:+ $*}"
+
+	# Updating the zonefile's mtime to a time after the last zone reload
+	# seems to be required for nsd-control to actually reload the zone;
+	# mtimes of included files seem to be ignored.
+	#
+	# Note that this is only really needed for unsigned zones (with the SOA
+	# serial in an $INCLUDEd file, but that's always the case here).  For
+	# signed zones, mtime is updated while signing.
+	#
+	if ! zone_signed; then
+		[ "$zf" -nt zone ] && touch -r "$zf" zone
+	fi
+
+	nsd-control reload "$zone" >/dev/null || err 'failed to reload zone'
+}
+
+# show combined (internal and external view) DNSSEC status of $zone
+status()
+{
+	local signed='N' dnssec='N'
+
+	[ $# -eq 0 ] || usage
+
+	# 1st output character: internal view
+	zone_signed && signed='Y'
+
+	# 2nd output character: external view
+	ds_exists && whois_sd && dnssec='Y'
+
+	printf "%c%c\n" "$signed" "$dnssec"
+}
+
+# show pending processes
+processes()
+{
+	local processes='bootstrap disable ksk_rollover zsk_rollover'
+	local p= sf= s= zp=
+	local debug=0
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--debug) debug=1; shift ;;
+			*) break ;;
+		esac
+	done
+	[ $# -eq 0 ] || usage
+
+	for p in $processes; do
+		sf="$STATUSDIR/$p"
+		[ -e "$sf" ] || continue # no such pending process
+
+		if [ $debug -eq 0 ]; then
+			s="$p"
+		else
+			case $p in
+				ksk_rollover)
+					s="$p.$ROLLOVER_METHOD_KSK:$(cat $sf)"
+					;;
+				zsk_rollover)
+					s="$p.$ROLLOVER_METHOD_ZSK:$(cat $sf)"
+					;;
+				*)
+					s="$p:$(cat $sf)"
+					;;
+			esac
+		fi
+		zp="${zp:+$zp }$s"
+	done
+	[ "$zp" ] && echo "$zp"
+	# return failure if no processes are pending
+}
+
+
+#
+# "internal" zone  commands (shown in usage() only in verbose mode)
+#
+
+# "Automatic DNSSEC Bootstrapping using Authenticated Signals from the Zone's Operator"
+# o https://datatracker.ietf.org/doc/draft-ietf-dnsop-dnssec-bootstrapping/
+#
+# supported by SWITCH, the registry for .ch and .li TLDs
+# o https://www.switch.ch/
+# o https://www.nic.ch/security/cds/
+# o https://www.nic.li/security/cds/
+#
+# why?
+# - safer DS enrollment method than what is otherwise used here
+#   (i.e. RFC 8078, "3.3. Accept after delay")
+# - shorten the delay for bootstrapping DNSSEC from ~3 days to ~1 day
+#
+# how?
+# - determine the set of name servers authoritative for $zone
+# - from that set, remove all name servers which are in $zone
+# - if that set is now empty, this method cannot be followed
+# - for each name server in that set, publish $zone's CDS and CDNSKEY RRs
+#   as _dsboot.<zone>._signal.<nameserver>.
+#
+# Note:
+# This Internet-Draft is not implemented here, but instructions about how to do
+# so manually are logged.
+#
+dnsop_dnssec_bootstrapping()
+{
+	local task= kfas=
+	local zone_ns= zone_ns_outside_zone= ns= kfa= kf= rr=
+
+	[ $# -gt 1 ] ||
+		usage 'dnsop_dnssec_bootstrapping publish|unpublish <key_file_alias> [...]'
+
+	task="$1"; shift
+	kfas="$@"
+
+	# determine name servers which need to publish these signal RRs
+	zone_ns=$(dig @"$AUTH_NS". "$zone". NS +short) || err 'dig(1) failed'
+	for ns in $zone_ns; do
+		[ "$ns" = "${ns%.$zone.}" ] || continue
+		zone_ns_outside_zone="${zone_ns_outside_zone:+$zone_ns_outside_zone }$ns"
+	done
+
+	# if all of $zone's name servers are in $zone, then do nothing
+	[ "$zone_ns_outside_zone" ] || return 0
+
+	case $task in
+		publish)
+			log 'if registry supports draft-ietf-dnsop-dnssec-bootstrapping,'
+			log 'this process can be accelerated by publishing the following RRs:'
+			;;
+		unpublish)
+			log 'if the following RRs have been published, they can now be removed:'
+			;;
+	esac
+
+	for ns in $zone_ns_outside_zone; do
+		for kfa in $kfas; do
+			kf="$(kfa_to_kf "$kfa")" || err "$kfa: invalid key file alias"
+			rr="$(awk -v ns="$ns" '{ $1 = "_dsboot." $1 "_signal." ns; print; }' "$kf")"
+			log "$rr"
+		done
+	done
+}
+
+# print key basename aliases of all keys
+keys()
+{
+	local kbna=
+
+	[ $# -eq 0 ] || usage 'keys'
+
+	for kbna in keys/*; do
+		[ -h "$kbna" ] || continue
+		echo "${kbna##keys/}"
+	done
+}
+
+# print key basename alias, key basename and key type of all keys
+list_keys()
+{
+	local kbna=
+	local keyfile= keytype=
+	local len= maxlen=0
+
+	[ $# -eq 0 ] || usage 'list_keys'
+
+	# cosmetics: determine max length of key basename aliases
+	for kbna in $(keys); do
+		len=$(echo -n "$kbna" | wc -m)
+		[ $len -gt $maxlen ] && maxlen=$len
+	done
+
+	for kbna in $(keys); do
+		keyfile=keys/"$(readlink keys/"$kbna")".key
+		keytype=
+		[ -f "$keyfile" ] && keytype="$(awk '{ print substr($11, 1, 5); }' "$keyfile")"
+		printf "%-*s %s %s\n" $maxlen "$kbna" "$(readlink keys/"$kbna")" "$keytype"
+	done
+}
+
+# create a key (KSK or ZSK)
+create_key()
+{
+	local keytype="$1" # KSK or ZSK (case insensitive)
+	local kbna="$2"
+	local kbn=
+
+	[ $# -eq 2 ] || usage 'create_key ksk|zsk <key_basename_alias>'
+	log "create_key${*:+ $*}"
+
+	[ -h keys/"$kbna" ] && err "$kbna: key basename alias already exists"
+	
+	mkdir -p keys
+	cd keys
+
+	case "$keytype" in
+		[Kk][Ss][Kk])
+			kbn=$($LDNS_KEYGEN -a "$KEY_ALGORITHM" -k "$zone") ||
+				err "failed to create KSK \`$kbna'"
+
+			# create files containing CDS and CDNSKEY RRs
+			# (needed for non-interactive DNSSEC bootstrapping and KSK rollover)
+			awk '$3 ~ /^DS$/     { $3 = "CDS";     print; }' $kbn.ds  >$kbn.cds
+			awk '$3 ~ /^DNSKEY$/ { $3 = "CDNSKEY"; print; }' $kbn.key >$kbn.cdnskey
+			;;
+		[Zz][Ss][Kk])
+			kbn=$($LDNS_KEYGEN -a "$KEY_ALGORITHM" "$zone") ||
+				err "failed to create ZSK \`$kbna'"
+			;;
+		*)
+			err "invalid key type \`$keytype'"
+			;;
+	esac
+
+	cd ..
+	ln -s "$kbn" keys/"$kbna"
+}
+
+# delete a key
+# (and also remove it from the set of keys to be used for signing, if it's in that set)
+delete_key()
+{
+	local kbna="$1"
+
+	[ $# -eq 1 ] || usage 'delete_key <key_basename_alias>'
+	log "delete_key${*:+ $*}"
+
+	[ -h keys/"$kbna" ] || err "$kbna: no such key basename alias"
+
+	# remove signing key reference if this is a signing key
+	is_signing_key "$kbna" && rm_signing_key "$kbna"
+
+	rm -f keys/$(readlink keys/"$kbna").*
+	rm -f keys/"$kbna"
+}
+
+# rename a key
+# (and also its name in the set of keys to be used for signing, if it's in that set)
+rename_key()
+{
+	local kbna_old="$1"
+	local kbna_new="$2"
+
+	[ $# -eq 2 ] || usage 'rename_key <old_key_basename_alias> <new_key_basename_alias>'
+	log "rename_key${*:+ $*}"
+
+	[ -h keys/"$kbna_old" ] || err "$kbna_old: no such key basename alias"
+	[ -h keys/"$kbna_new" ] && err "$kbna_new: key basename alias already exists"
+
+	# adjust signing key reference if this is a signing key
+	is_signing_key "$kbna_old" && mv_signing_key "$kbna_old" "$kbna_new"
+
+	mv -f keys/"$kbna_old" keys/"$kbna_new"
+}
+
+# print key basename aliases of all keys in the set of keys to be used for
+# signing
+signing_keys()
+{
+	local sk=
+
+	[ $# -eq 0 ] || usage 'signing_keys'
+
+	mkdir -p "$SKDIR"
+	for sk in "$SKDIR"/*; do
+		[ -e "$sk" ] || continue
+		echo "${sk#$SKDIR/}"
+	done
+}
+
+# is key basename alias $1 in the set of keys to be used for signing?
+is_signing_key()
+{
+	local kbna="$1"
+
+	[ $# -eq 1 ] || usage 'is_signing_key <key_basename_alias>'
+
+	[ -e "$SKDIR/$kbna" ]
+}
+
+# add key basename alias $1 to the set of keys to be used for signing
+add_signing_key()
+{
+	local kbna="$1"
+
+	[ $# -eq 1 ] || usage 'add_signing_key <key_basename_alias>'
+	log "add_signing_key${*:+ $*}"
+
+	is_signing_key "$kbna" && err "$kbna: signing key exists"
+
+	mkdir -p "$SKDIR"
+	touch "$SKDIR/$kbna"
+}
+
+# remove key basename alias $1 from the set of keys to be used for signing
+rm_signing_key()
+{
+	local kbna="$1"
+
+	[ $# -eq 1 ] || usage 'rm_signing_key <key_basename_alias>'
+	log "rm_signing_key${*:+ $*}"
+
+	is_signing_key "$kbna" || err "$kbna: no such signing key"
+
+	rm -f "$SKDIR/$kbna"
+}
+
+# rename reference to key basename alias $1 in the set of keys to be used for
+# signing
+mv_signing_key()
+{
+	local kbna_old="$1"
+	local kbna_new="$2"
+
+	[ $# -eq 2 ] || usage 'mv_signing_key <old_key_basename_alias> <new_key_basename_alias>'
+	log "mv_signing_key${*:+ $*}"
+
+	is_signing_key "$kbna_old" || err "$kbna_old: no such signing key"
+	is_signing_key "$kbna_new" && err "$kbna_new: signing key exists"
+
+	mv -f "$SKDIR/$kbna_old" "$SKDIR/$kbna_new"
+}
+
+# translate key file alias to key file
+kfa_to_kf()
+{
+	local kfa="$1"
+	local kbna= suffix= kf=
+
+	[ $# -eq 1 ] || usage 'kfa_to_kf <key_file_alias>'
+
+	kbna=${kfa%.*}
+	suffix=${kfa##*.}
+	[ -h keys/"$kbna" ] || err "$kbna: no such key basename alias"
+	kf=keys/"$(readlink keys/"$kbna")"."$suffix"
+	[ -f "$kf" ] || err "$kf: no such key file"
+
+	echo "$kf"
+}
+
+# does key zone file contain key file alias $1?
+kzf_has_kf()
+{
+	local kfa="$1" kf=
+	local zf="$ZONEFILE_KEYS"
+
+	[ $# -eq 1 ] || usage 'kzf_has_kf <key_file_alias>'
+
+	kf="$(kfa_to_kf "$kfa")" || err "$kfa: invalid key file alias"
+	grep -E -q "^\\\$INCLUDE $(esc "$zone")/$(esc "$kf")$" "$zf"
+}
+
+# add key file alias $1 to key zone file
+kzf_add_kf()
+{
+	local kfa="$1" kf=
+	local zf="$ZONEFILE_KEYS"
+
+	[ $# -eq 1 ] || usage 'kzf_add_kf <key_file_alias>'
+	log "kzf_add_kf${*:+ $*}"
+
+	kf="$(kfa_to_kf "$kfa")" || err "$kfa: invalid key file alias"
+	kzf_has_kf "$kfa" && err 'key file alias already in key zone file'
+	echo "\$INCLUDE $zone/$kf" >>"$zf"
+}
+
+# remove key file alias $1 from key zone file
+kzf_rm_kf()
+{
+	local kfa="$1" kf=
+	local zf="$ZONEFILE_KEYS" zf_tmp=
+
+	[ $# -eq 1 ] || usage 'kzf_rm_kf <key_file_alias>'
+	log "kzf_rm_kf${*:+ $*}"
+
+	kf="$(kfa_to_kf "$kfa")" || err "$kfa: invalid key file alias"
+	kzf_has_kf "$kfa" || err 'key file alias not in key zone file'
+	zf_tmp="$(mktemp "$zf".XXXXXXXXXX)" || err 'mktemp(1) failed'
+	cp -a "$zf" "$zf_tmp"
+	grep -E -v "\\\$INCLUDE $(esc "$zone")/$(esc "$kf")$" "$zf_tmp" >"$zf"
+	rm -f "$zf_tmp"
+}
+
+# DNSSEC internal status:
+# check whether $zone is served signed or unsigned
+# returns
+#   0 if signed
+#   1 if unsigned
+zone_signed()
+{
+	local rrsigs=
+
+	[ $# -eq 0 ] || usage 'zone_signed'
+
+	rrsigs=$(dig @"$AUTH_NS". "$zone". RRSIG +short) || err 'dig(1) failed'
+	[ "$rrsigs" ]
+
+	# alternative check:
+	#case "$(nsd-checkconf -z "$zone" -o zonefile "$NSD_CONF")" in
+	#	*.signed|*/signed) return 0 ;;
+	#esac
+	#return 1
+}
+
+# DNSSEC external status 1:
+# check whether DNSSEC is enabled from a parent zone point of view, i.e. based
+# on the presence of a DS RR (which needs to match the one from key file alias
+# $1 if supplied)
+# returns
+#   0 if no kfa was supplied and a DS RR exists,
+#     or if a kfa was supplied which matches at least one of the DS RRs
+#   1 if no DS RR exists,
+#     or if a kfa was supplied but it matches none of the DS RRs
+# and exits with an error if status is unknown
+ds_exists()
+{
+	local kfa= kf=
+	local parent_zone_ns= pzns=
+	local parent_ds= zone_ds=
+	local debug=0
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--debug) debug=1; shift ;;
+			*) break ;;
+		esac
+	done
+
+	[ $# -le 1 ] || usage 'ds_exists [[--debug] <key_file_alias>]'
+	kfa="$1"
+
+	parent_zone_ns=$(dig "${zone#*.}". NS +short) || err 'dig(1) failed'
+	[ "$parent_zone_ns" ] || err 'failed to get NS for parent zone'
+
+	for pzns in $parent_zone_ns; do
+		parent_ds="$(dig @"$pzns" "$zone". DS +short)" || continue
+
+		# if there's no DS RR, we're done here
+		[ "$parent_ds" ] || return 1
+
+		# if no key file alias was supplied to compare the DS RR in the
+		# parent zone with, we're also done here
+		[ "$kfa" ] || return 0
+
+		# check whether key file alias matches a DS RR
+		kf="$(kfa_to_kf "$kfa")" || err "$kfa: invalid key file alias"
+		zone_ds="$(cat "$kf")"
+		echo "$parent_ds" | awk -v zds="$zone_ds" -v debug="$debug" '
+			BEGIN {
+				matching_parent_ds_found = 0;
+				failed = 0;
+
+				if (split(zds, zone_ds) != 7) {
+					failed = 1;
+					exit;
+				}
+				z_keytag     = zone_ds[4];
+				z_algorithm  = zone_ds[5];
+				z_digesttype = zone_ds[6];
+				z_digest     = tolower(zone_ds[7]);
+			}
+			{
+				# expecting parent zone DS RR in dig(1) +short format
+				if (NF < 4) {
+					failed = 1;
+					exit;
+				}
+				p_keytag     = $1;
+				p_algorithm  = $2;
+				p_digesttype = $3;
+				p_digest     = "";
+				for (i=4; i<=NF; ++i) {
+					p_digest = p_digest tolower($i);
+				}
+				if (debug) {
+					print "keytag";
+					print "  zone:     " z_keytag;
+					print "  parent:   " p_keytag;
+					print "algorithm";
+					print "  zone:     " z_algorithm;
+					print "  parent:   " p_algorithm;
+					print "digesttype";
+					print "  zone:     " z_digesttype;
+					print "  parent:   " p_digesttype;
+					print "digest";
+					print "  zone:     " z_digest;
+					print "  parent:   " p_digest;
+				}
+				if (z_keytag     == p_keytag &&
+				    z_algorithm  == p_algorithm &&
+				    z_digesttype == p_digesttype &&
+				    z_digest     == p_digest) {
+					matching_parent_ds_found = 1;
+					if (debug) {
+						print "(match)";
+					}
+					exit;
+				}
+				if (debug) {
+					print "(no match)";
+				}
+				# parent DS does not match, trying next if any...
+			}
+			END {
+				if (failed) {
+					exit 2;
+				}
+				if (matching_parent_ds_found) {
+					exit 0;
+				}
+				# no matching parent DS found
+				exit 1;
+			}'
+		case $? in
+			0|1) return $? ;;
+			*) err 'failed to compare DS RRs' ;;
+		esac
+		# exit loop after first responding $pzns
+	done
+}
+
+# DNSSEC external status 2:
+# check whether DNSSEC is enabled from a registry point of view, i.e. based on
+# WHOIS data
+# returns
+#   0 if enabled
+#   1 if not enabled
+# and exits with an error if status is unknown
+#
+# understands output as produced by...
+# - whois.nic.ch/whois.nic.li
+# - whois.iis.se/whois.iis.nu
+#
+whois_sd()
+{
+	local whois=
+
+	[ $# -eq 0 ] || usage 'whois_sd'
+
+	whois="$(whois "$zone")" || err 'whois(1) failed'
+	case "$whois" in
+		*DNSSEC:Y*|*dnssec:*\ signed\ delegation*)
+			return 0
+			;;
+		*DNSSEC:N*|*dnssec:*\ unsigned\ delegation*)
+			return 1
+			;;
+		*)
+			err "failed to determine DNSSEC status: \"$whois\""
+			;;
+	esac
+}
+
+# print largest TTL of RRs of type $1
+# - $1 is either a single RR type or a comma-separated list of RR types
+# - RRs of type DS are searched in $zone's parent zone
+max_ttl()
+{
+	local rr_types="$1"
+	local rr_type=
+	local parent_zone_ns= pzns=
+	local dig_ans= 
+	local ttl= ttl_max=0
+
+	[ $# -eq 1 ] || usage 'max_ttl <rr_type(s)>'
+
+	for rr_type in $(echo "$rr_types" | sed 's/,/ /g'); do
+		case "$rr_type" in
+		[Dd][Ss])
+			parent_zone_ns="$(dig "${zone#*.}". NS +short)" ||
+				err 'dig(1) failed'
+			for pzns in $parent_zone_ns; do
+				dig_ans="$(dig @"$pzns" "$zone". DS +noall +answer)" ||
+					continue
+				break
+			done
+			;;
+		*)
+			dig_ans="$(dig @"$AUTH_NS". "$zone". "$rr_type" +noall +answer)" ||
+				err 'dig(1) failed'
+			;;
+		esac
+
+		ttl="$(echo "$dig_ans" | awk '
+			/^[^;]/ {
+				if ($2 > max) {
+					max = $2;
+				}
+			}
+			END {
+				print max;
+			}
+		')"
+		[ "$ttl" ] || err "failed to get TTL of $rr_type RR"
+
+		if [ $ttl_max -lt $ttl ]; then
+			ttl_max=$ttl
+		fi
+	done
+
+	echo "$ttl_max"
+}
+
+# print negative caching TTL as defined by RFC 2308
+# (i.e. "minimum of the MINIMUM field of the SOA record and the TTL of the SOA itself")
+nc_ttl()
+{
+	local dig_ans=
+	local ttl=
+
+	[ $# -eq 0 ] || usage 'nc_ttl'
+
+	dig_ans="$(dig @"$AUTH_NS". "$zone". 'SOA' +noall +answer)" ||
+		err 'dig(1) failed'
+
+	ttl="$(echo "$dig_ans" | awk '
+		/^[^;]/ {
+			if ($2 < $11) {
+				print $2; # TTL
+			}
+			else {
+				print $11; # SOA MINIMUM
+			}
+		}
+	')"
+	[ "$ttl" ] || err "failed to get negative caching TTL"
+
+	echo "$ttl"
+}
+
+
+#
+# main
+
+# parse command line options
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-q|--quiet)
+			opt_q=1
+			shift
+			;;
+		-v|--verbose)
+			opt_v=1
+			shift
+			;;
+		-h|--help)
+			usage
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+# global commands
+if [ $# -eq 1 ]; then
+	case "$1" in
+		zones)
+			$1; exit $EXIT_SUCCESS ;;
+	esac
+fi
+
+[ $# -ge 2 ] || usage
+
+zone="$1"; shift
+cd "$ZONESDIR/$zone" || err --nolog "cd to $ZONESDIR/$zone failed"
+
+get_settings
+
+set_traps
+lock || err_locked
+
+# zone commands
+zcmd="$1"; shift
+case "$zcmd" in
+	# zone  commands
+	bootstrap|disable|ksk_rollover|zsk_rollover|\
+	signzone|soa_serial_increment|reload|status|processes)
+		$zcmd "$@"
+		;;
+	# "internal" zone  commands
+	dnsop_dnssec_bootstrapping|\
+	keys|list_keys|create_key|delete_key|rename_key|\
+	signing_keys|is_signing_key|add_signing_key|rm_signing_key|mv_signing_key|\
+	kfa_to_kf|\
+	kzf_has_kf|kzf_add_kf|kzf_rm_kf|\
+	zone_signed|ds_exists|whois_sd|\
+	max_ttl|nc_ttl)
+		$zcmd "$@"
+		;;
+	*)
+		usage
+		;;
+esac

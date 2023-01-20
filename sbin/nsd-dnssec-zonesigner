@@ -1,0 +1,75 @@
+#!/bin/sh
+#
+# Sign DNSSEC-enabled zones whose lowest RRSIG expiration time is less than
+# $SIGN_DAYS_BEFORE_EXPIRATION in the future.
+#
+#
+# jukka@salmi.ch 2019-11-27
+#
+
+PROG="${0##*/}"
+
+: ${SIGN_DAYS_BEFORE_EXPIRATION:=14} \
+  ${RRSIG_LOWEST_SIGEXP:=rrsig_lowest-sigexp}
+
+# note: $SIGN_DAYS_BEFORE_EXPIRATION needs to be less than
+# $RRSIG_EXPIRE_AFTER_DAYS from nsd-dnssec
+
+warn()
+{
+	echo "$PROG: $*" >&2
+}
+
+err()
+{
+	warn "$*"
+	exit 1
+}
+
+dry_run=0
+verbose=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-n|--dry-run)
+			dry_run=1
+			shift
+			;;
+		-v|--verbose)
+			verbose=1
+			shift
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+# if no zones were specified, check all zones
+[ $# -eq 0 ] && set -- $(nsd-dnssec zones)
+
+for zone; do
+	rrsigs="$(dig "$zone". RRSIG +short)" || err 'dig(1) failed'
+	[ "$rrsigs" ] || continue # skip unsigned zones
+
+	rrsig_exp="$(echo "$rrsigs" | $RRSIG_LOWEST_SIGEXP)"
+	if [ $? -ne 0 ]; then
+		warn "failed to get lowest RRSIG expiration, skipping $zone ($rrsig_exp)"
+		continue
+	fi
+	now=$(TZ='UTC' date '+%s')
+	rrsig_exp_s=$(($rrsig_exp - $now))
+	tolerance=$(($SIGN_DAYS_BEFORE_EXPIRATION * 60*60*24))
+	rrsig_exp_d=$(($rrsig_exp_s/(60*60*24)))
+
+	if [ $rrsig_exp_s -lt $tolerance ]; then
+		echo "signing zone $zone (RRSIGs would expire in $rrsig_exp_d days)"
+		[ $dry_run -eq 1 ] && continue
+		nsd-dnssec "$zone" signzone || {
+			warn "\`nsd-dnssec $zone signzone' failed [$?]"
+			continue
+		}
+	else
+		[ $verbose -eq 0 ] ||
+			echo "not signing zone $zone (RRSIGs would expire in $rrsig_exp_d days)"
+	fi
+done

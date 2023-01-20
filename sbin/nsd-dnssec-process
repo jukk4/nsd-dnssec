@@ -1,0 +1,203 @@
+#!/bin/sh
+#
+# Start key rollovers for DNSSEC-signed zones or resume pending processes like
+# key rollovers, bootstrapping and disabling DNSSEC.
+#
+#
+# jukka@salmi.ch 2019-11-27
+#
+
+PROG="${0##*/}"
+
+# needs to be kept in sync with nsd-dnssec
+EXIT_SUCCESS=0
+EXIT_TEMPFAIL=75
+EXIT_USAGE=64
+EXIT_FAILURE=1
+
+usage()
+{
+	if [ $# -gt 0 ]; then
+		echo "usage: $*" >&2
+	else
+		cat <<-EOF >&2
+		usage:
+		  $PROG list [zones]
+		  $PROG start ksk_rollover|zsk_rollover [zones]
+		  $PROG resume [zones]
+		EOF
+	fi
+
+	exit $EXIT_USAGE
+}
+
+warn()
+{
+	echo "$PROG: $*" >&2
+}
+
+err()
+{
+	warn "$*"
+	exit $EXIT_FAILURE
+}
+
+max()
+{
+	if [ $1 -gt $2 ]; then
+		echo $1
+	else
+		echo $2
+	fi
+}
+
+# call nsd-dnssec with appropriate zone and zone command
+process()
+{
+	local zone="$1"
+	local zcmd="$2"
+
+	[ $# -eq 2 ] || usage 'process <zone> <zone_command>'
+
+	nsd-dnssec -q "$zone" "$zcmd"
+	case $? in
+		$EXIT_SUCCESS|$EXIT_TEMPFAIL)
+			return $?
+			;;
+		*)
+			err "\`nsd-dnssec -q $zone $zcmd' failed [$?]"
+			;;
+	esac
+}
+
+# list pending processes
+list()
+{
+	local zones= zone=
+	local len= maxlen=0
+	local procs=
+	local debug=
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--debug) debug='--debug'; shift ;;
+			*) break ;;
+		esac
+	done
+
+	if [ $# -eq 0 ]; then
+		zones="$(nsd-dnssec zones)"
+	else
+		zones="$@"
+	fi
+
+	# cosmetics: determine longest zone name
+	for zone in $zones; do
+		len=$(echo -n "$zone" | wc -m)
+		[ $len -gt $maxlen ] && maxlen=$len
+	done
+
+	# if a zone has pending processes, print them
+	for zone in $zones; do
+		procs="$(nsd-dnssec "$zone" processes $debug)"
+		[ "$procs" ] || continue
+		printf "%-*s %s\n" $maxlen "$zone" "$procs"
+	done
+
+	return $EXIT_SUCCESS
+}
+
+# start new processes
+start()
+{
+	local zcmd=
+	local zones= zone= procs= proc=
+	local pending=
+	local rv=$EXIT_SUCCESS
+
+	[ $# -ge 1 ] || usage
+
+	case "$1" in
+		[kz]sk_rollover)
+			zcmd="$1"
+			shift
+			;;
+		*)
+			usage
+			;;
+	esac
+
+	if [ $# -eq 0 ]; then
+		zones=$(nsd-dnssec zones)
+	else
+		zones="$@"
+	fi
+
+	for zone in $zones; do
+		# only start key rollovers for DNSSEC-enabled zones
+		[ "$(nsd-dnssec "$zone" status)" = 'YY' ] || continue
+
+		# make sure the requested type of process is not already running
+		# (starting a process which is already running would not be
+		# critical, actually it would be equivalent to just resuming
+		# it, but anyway...)
+		pending=0
+		procs="$(nsd-dnssec "$zone" processes)"
+		for proc in $procs; do
+			if [ $proc = $zcmd ]; then
+				pending=1
+				break
+			fi
+		done
+		if [ $pending -eq 1 ]; then
+			warn "not starting another $zcmd for $zone"
+			continue
+		fi
+
+		process "$zone" "$zcmd"
+		rv=$(max $rv $?)
+	done
+
+	return $rv
+}
+
+# resume pending processes
+resume()
+{
+	local zones= zone= procs= proc=
+	local zcmd=
+	local rv=$EXIT_SUCCESS
+
+	if [ $# -eq 0 ]; then
+		zones=$(nsd-dnssec zones)
+	else
+		zones="$@"
+	fi
+
+	for zone in $zones; do
+		procs="$(nsd-dnssec "$zone" processes)"
+		for proc in $procs; do
+			zcmd=$proc
+			process "$zone" "$zcmd"
+			rv=$(max $rv $?)
+		done
+	done
+
+	return $rv
+}
+
+
+#
+# main
+
+case "$1" in
+	list|start|resume)
+		cmd=$1; shift
+		$cmd "$@"
+		;;
+	*)
+		usage
+		;;
+esac
+
+# exiting with either $EXIT_SUCCESS or $EXIT_TEMPFAIL

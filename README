@@ -1,0 +1,51 @@
+some solutions/hacks for problems I encountered while using DNSSEC with [1]nsd/[2]ldns
+
+jukka@salmi.ch 2019-11
+
+
+problem:
+	DNSSEC bootstrapping, key rollovers, zone signing etc. need quite some
+	typing and waiting when done manually.
+	
+solution:
+	sbin/nsd-dnssec				helper script for these tasks
+
+	other helper scripts, intended to be run periodically:
+
+	sbin/nsd-dnssec-process			list, start and resume
+						processes like key rollovers
+						for multiple zones at once
+	sbin/nsd-dnssec-zonesigner		sign zones whose RRSIGs would
+						expire soon
+
+
+problem:
+	Being able to increment a zone's SOA serial non-interactively is useful
+	during DNSSEC processes, and needs to be done as an atomic operation
+	together with e.g. the signing of a zone.
+
+solution:
+	bin/zonefile_soa-serial-increment.sh	increments the SOA serial
+	sbin/nsd-dnssec				does the locking
+
+	to be used implicitly during
+	$ nsd-dnssec $zone signzone
+	or explicitly as
+	$ nsd-dnssec $zone soa_serial_inc
+
+
+problem:
+	$INCLUDE control entries in zone files (as defined in RFC 1035) are
+	supported by nsd but not by ldns (and thus not by e.g. ldns-signzone(1)).
+
+solution:
+	bin/ldns-signzone_includes		ldns-signzone(1) wrapper which
+						handles $INCLUDE control entries
+	sbin/nsd-dnssec				does the locking
+
+	to be used implicitly during
+	$ nsd-dnssec $zone signzone
+
+
+[1] https://www.nlnetlabs.nl/projects/nsd/
+[2] https://www.nlnetlabs.nl/projects/ldns/

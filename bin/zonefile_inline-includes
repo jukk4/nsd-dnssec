@@ -1,0 +1,89 @@
+#! /usr/bin/awk -f
+#
+# Read zone file and print its contents, replacing $INCLUDE control entries (as
+# defined in RFC 1035) with the contents of the files they include. This is
+# done recursively, i.e. $INCLUDE control entries in included files are also
+# replaced.
+#
+# (to be called from ldns-signzone_includes)
+#
+#
+# jukka@salmi.ch 2019-11-10
+#
+
+#
+# variables:
+# - relpnrefdir ("relative pathname reference directory")
+#       when set to "foo", relative pathnames in the filename argument of
+#       $INCLUDE control entries are taken to be relative to directory "foo"
+#
+
+BEGIN {
+	# XXX is there a more elegant way to have an AWK program call itself?
+	MYSELF = "zonefile_inline-includes";
+}
+
+$1 ~ /^\$ORIGIN$/ {
+	origin = $0;
+}
+
+$1 ~ /^\$INCLUDE$/ {
+	# at least one argument is required: the file to be included
+	if (NF < 2) {
+		print "invalid $INCLUDE control entry: " $0 >"/dev/stderr";
+		exit 1;
+	}
+
+	# if comment is specified, print it
+	if (NF >= 4) {
+		cf = split($0, comment);
+		printf ";";
+		for (i=4; i<=cf; ++i) {
+			printf(" %s", comment[i]);
+		}
+		printf "\n";
+		delete comment;
+	}
+
+	# if domain name is specified, set origin accordingly
+	# (and make sure current origin is known, otherwise resetting origin
+	# after the include file has been read would not be possible...)
+	if (NF >= 3) {
+		if (!origin) {
+			print "unknown current origin" >"/dev/stderr";
+			exit 1;
+		}
+		print "$ORIGIN " $3;
+	}
+
+	# print contents of included file
+	if ($2 !~ /^\// && relpnrefdir) {
+		# relative pathname (and reference dir specified)
+		include_file = relpnrefdir "/" $2;
+	}
+	else {
+		# absolute pathname (or reference dir not specified)
+		include_file = $2;
+	}
+	cmd = MYSELF " -v relpnrefdir='" relpnrefdir "' '" include_file "'";
+	while ((rv = cmd | getline line) == 1) {
+		print line;
+	}
+	if (rv == -1) {
+		print "getline returned error" >"/dev/stderr";
+		exit 1;
+	}
+	close(cmd);
+
+	# reset origin if needed
+	if (NF >= 3) {
+		print origin;
+	}
+
+	next;
+}
+
+{
+	# print all other lines unmodified
+	print;
+}

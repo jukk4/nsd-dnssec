@@ -1,0 +1,12 @@
+[Unit]
+Description=initiate ZSK rollovers for DNSSEC-enabled zones
+
+[Timer]
+#OnCalendar=monthly
+# monthly in first half of week 2:
+OnCalendar=*-*-08
+RandomizedDelaySec=3d
+Persistent=true
+
+[Install]
+WantedBy=timers.target

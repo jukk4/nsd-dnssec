@@ -1,0 +1,83 @@
+#! /usr/bin/awk -f
+#
+# Read RRSIG RRs (in dig(1) +short format, one RR per line) and print lowest
+# (aka earliest) Signature Expiration in seconds since epoch.
+#
+# (to be called from nsd-dnssec-zonesigner)
+#
+#
+# jukka@salmi.ch 2019-11-27
+#
+
+# convert "human readable" date (YYYYMMDDHHmmSS) to seconds since epoch
+function hrdate_to_sse(hrdate,    Y, M, D, H, m, S, cmd, sse)
+{
+	if (length(hrdate) != 14) {
+		print "invalid hrdate (" hrdate ")" >"/dev/stderr";
+		error = 1;
+		exit;
+	}
+
+	Y = substr(hrdate,  1, 4);
+	M = substr(hrdate,  5, 2);
+	D = substr(hrdate,  7, 2);
+	H = substr(hrdate,  9, 2);
+	m = substr(hrdate, 11, 2);
+	S = substr(hrdate, 13, 2);
+
+	cmd = "TZ=UTC date -d \"" Y "-" M "-" D " " H ":" m ":" S "\" +%s";
+	if ((cmd | getline sse) != 1) {
+		# failure or EOF
+		print "cmd|getline failed" >"/dev/stderr";
+		error = 1;
+		exit;
+	}
+	close(cmd);
+	return sse;
+}
+
+NF < 9 {
+	print "invalid RRSIG RR: " $0 >"/dev/stderr";
+	error = 1;
+	exit;
+}
+
+{
+	# $5: Signature Expiration (uint32)
+	sigexp = $5;
+	sigexp_len = length(sigexp);
+	sigexp_sse = 0;
+
+	# detect formats described in RFC 4034:
+	#
+	# 1) seconds since 1970-01-01 00:00:00 UTC ("UNIX epoch")
+	if (sigexp_len > 0 && sigexp_len <= 10) {
+		sigexp_sse = sigexp+0;
+	}
+	# 2) YYYYMMDDHHmmSS
+	else if (sigexp_len == 14) {
+		sigexp_sse = hrdate_to_sse(sigexp)+0;
+	}
+	else {
+		print "invalid Signature Expiration format: " \
+			sigexp " (" sigexp_len ")" >"/dev/stderr";
+		error = 1;
+		exit;
+	}
+
+	if (!lowest_sse || sigexp_sse < lowest_sse) {
+		lowest_sse = sigexp_sse;
+	}
+}
+
+END {
+	if (error) {
+		exit 1;
+	}
+
+	if (!lowest_sse) {
+		print "no lowest_sse!" >"/dev/stderr";
+		exit 1;
+	}
+	print lowest_sse;
+}

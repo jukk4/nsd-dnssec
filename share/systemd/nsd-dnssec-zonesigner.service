@@ -1,0 +1,6 @@
+[Unit]
+Description=sign DNSSEC-enabled zones before their RRSIGs expire
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nsd-dnssec-zonesigner

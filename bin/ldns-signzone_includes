@@ -1,0 +1,97 @@
+#!/bin/sh
+#
+# Enable ldns-signzone(1) to sign zone files containing $INCLUDE control
+# entries.
+#
+# [1]ldns and thus ldns-signzone(1) do not support $INCLUDE control entries (as
+# defined in RFC 1035). This wrapper adds that feature by...
+# - calling a helper script which replaces all such control entires with the
+#   contents of the files they include, and then
+# - calling the "real" ldns-signzone(1) on that "inlined" zone file.
+#
+# [1] https://www.nlnetlabs.nl/projects/ldns/about/
+#
+#
+# jukka@salmi.ch 2019-11-10
+#
+
+: ${REAL_LDNS_SIGNZONE:=ldns-signzone} \
+  ${ZONEFILE_INLINE_INCLUDES:=zonefile_inline-includes} \
+  ${RELATIVE_PATHNAME_REFDIR}
+
+PROG=${0##*/}
+
+err()
+{
+	echo "$PROG: $*" >&2
+	exit 1
+}
+
+# parse command options
+#
+# (optstring from ldns-1.8.3/examples/ldns-signzone.c)
+_tmp=$(getopt -o 'a:bde:f:i:k:no:ps:t:uvz:ZAUE:K:' -s 'sh' -n "$PROG" -- "$@") ||
+	err 'getopt(1) failed'
+eval set -- "$_tmp"
+unset _tmp
+#
+while [ $# -gt 0 ]; do
+	case "$1" in
+		# options without arguments
+		-[bdnpuvZAU])
+			eval opt_${1#-}=$1
+			shift
+			;;
+		# options with arguments
+		-[aefikostzEK])
+			eval opt_${1#-}=$1
+			eval opt_${1#-}_arg=\"$2\"
+			shift 2
+			;;
+		# option/non-option separator
+		--)
+			shift
+			break
+			;;
+	esac
+done
+
+# if not at least two arguments are left, let $REAL_LDNS_SIGNZONE complain
+# about missing arguments, and then exit
+[ $# -ge 2 ] || exec "$REAL_LDNS_SIGNZONE"
+
+zonefile="$1"; shift # remaining parameter(s) is/are the key(s)
+
+# create temporary zone file with all $INCLUDEd files inlined
+zonefile_tmp="$(mktemp "$zonefile".XXXXXXXXXX)" || err 'mktemp(1) failed'
+"$ZONEFILE_INLINE_INCLUDES" \
+	-v relpnrefdir="$RELATIVE_PATHNAME_REFDIR" \
+	"$zonefile" >"$zonefile_tmp" ||
+	err "$ZONEFILE_INLINE_INCLUDES failed"
+
+# if `-f file' was not specified, this option needs to be set here to retain
+# the default output file as expected by the caller of this wrapper
+# (otherwise it would be $zonefile_tmp.signed)
+if [ ! "$opt_f" ]; then
+	opt_f='-f'
+	opt_f_arg="$zonefile.signed"
+fi
+
+# sign (temporary) "inlined" zone file
+"$REAL_LDNS_SIGNZONE" \
+	$opt_b $opt_d $opt_n $opt_p $opt_u $opt_v $opt_Z $opt_A $opt_U \
+	${opt_a+-a "$opt_a_arg"} \
+	${opt_e+-e "$opt_e_arg"} \
+	${opt_f+-f "$opt_f_arg"} \
+	${opt_i+-i "$opt_i_arg"} \
+	${opt_k+-k "$opt_k_arg"} \
+	${opt_o+-o "$opt_o_arg"} \
+	${opt_s+-s "$opt_s_arg"} \
+	${opt_t+-t "$opt_t_arg"} \
+	${opt_z+-z "$opt_z_arg"} \
+	${opt_E+-E "$opt_E_arg"} \
+	${opt_K+-K "$opt_K_arg"} \
+	"$zonefile_tmp" "$@"
+rv=$?
+rm -f "$zonefile_tmp"
+exit $rv

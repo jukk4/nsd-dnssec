@@ -1,0 +1,113 @@
+#! /usr/bin/awk -f
+#
+# Read zone file and print its contents with an incremented SOA serial.
+#
+# Expects the serial number to occur on its own line and to be followed by the
+# comment "serial":
+#
+# @	IN	SOA	foo.bar.baz. hostmaster.example.org. (
+# 			12345	; serial
+# 			4h	; refresh
+# 			1h	; retry
+# 			1w	; expire
+# 			5m	; minimum
+# 			)
+#
+# Note that no real zone file parsing is done; any number matching above
+# description is incremented, even if it occurs outside of a SOA RR.
+#
+# (to be called from zonefile_soa-serial-increment.sh)
+#
+#
+# jukka@salmi.ch 2019-11-12
+#
+
+BEGIN {
+	#
+	# Make sure unsigned 32 bit integers (like SOA serials) are always
+	# represented as integers and not in scientific notation.  Otherwise 
+	# invalid SOA serials could be printed.
+	#
+	# Notes:
+	# - this is needed at least with mawk 1.3.4
+	# - interpreting serials as strings instead would avoid the issue, but
+	#   then comparison operations would not produce the expected results:
+	#   e.g. "5">=2^32-1 would be considered "true"...
+	#
+	uint32 = 2^32-1;
+	if (uint32 !~ /^[0-9]+$/) {
+		CONVFMT = OFMT = "%.0f"; # or "%.10g"
+		if (uint32 !~ /^[0-9]+$/) {
+			print "failed to represent 2^32-1 as an integer" >"/dev/stderr";
+			exit 1 ;
+		}
+	}
+}
+
+# increment serial by one, wrapping at uint32 boundary (RFC 1035)
+function next_serial(serial)
+{
+	if (serial < 2^32-1) {
+		return serial+1;
+	}
+	else {
+		# wrap, cautiously skipping zero
+		return 1;
+	}
+}
+
+/^[\t ]*[0-9]+[\t ]*;[\t ]*serial[\t ]*$/ {
+	match($0, /^[\t ]*/);
+	prae   = substr($0, RSTART, RLENGTH);
+
+	match($0, /[0-9]+/);
+	serial = substr($0, RSTART, RLENGTH) + 0;
+
+	match($0, /[\t ]*;[\t ]*serial[\t ]*$/);
+	post   = substr($0, RSTART, RLENGTH);
+
+	#
+	# try to detect serial format recommended in RFC 1912 (YYYYMMDDnn) and
+	# to stick to it, falling back to just incrementing the serial if this
+	# fails
+	#
+	if (rfc1912_serial_format && !new_serial && length(serial) == 10) {
+		# assume YYYYMMDDnn format
+		cmd = "TZ='UTC' date '+%Y%m%d'";
+		if ((cmd | getline today) == 1) {
+			# success
+			if (today >= substr(serial, 1, 8)+0) {
+				new_serial = today * 100 + 1; # nn = 01
+				while (new_serial <= serial) {
+					new_serial = next_serial(new_serial);
+					# ignore possible "overflow" to next
+					# day (or to non-existent date), but
+					# terminate loop if serial wraps
+					if (new_serial == 1) {
+						break;
+					}
+				}
+			}
+		}
+		close(cmd);
+	}
+
+	if (!new_serial) {
+		new_serial = next_serial(serial);
+	}
+
+	print prae new_serial post;
+	++serials_incremented;
+	next;
+}
+
+{
+	# print all other lines unmodified
+	print;
+}
+
+END {
+	if (serials_incremented != 1) {
+		exit 1 ;
+	}
+}

@@ -1,0 +1,7 @@
+[Unit]
+Description=initiate KSK rollovers for DNSSEC-enabled zones
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nsd-dnssec-process start ksk_rollover
+SuccessExitStatus=TEMPFAIL
