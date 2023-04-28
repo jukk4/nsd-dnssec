@@ -151,6 +151,7 @@ usage()
 		  reload
 		  status
 		  processes [--debug]
+		  log [<message>]
 		  dnsop_dnssec_bootstrapping publish|unpublish <key_file_alias> [...]
 		  keys
 		  list_keys
@@ -1849,6 +1850,7 @@ case "$zcmd" in
 		$zcmd "$@"
 		;;
 	# "internal" zone  commands
+	log|\
 	dnsop_dnssec_bootstrapping|\
 	keys|list_keys|create_key|delete_key|rename_key|\
 	signing_keys|is_signing_key|add_signing_key|rm_signing_key|mv_signing_key|\
